@@ -3,8 +3,13 @@
 //! of AENEAS, it means the return variable contains ⊥ upon returning.
 //! For this reason, when the function has return type unit, we insert
 //! an extra assignment just before returning.
+use take_mut::take;
+
 use crate::expressions::*;
-use crate::llbc_ast::{FunDecl, FunDecls, Statement, SwitchTargets};
+use crate::llbc_ast::{
+    ExprBody, FunDecl, FunDecls, GlobalDecl, GlobalDecls, Statement, SwitchTargets,
+};
+use crate::names::Name;
 use crate::values::*;
 use std::iter::FromIterator;
 
@@ -22,6 +27,7 @@ fn transform_st(st: Statement) -> Statement {
             Statement::Sequence(Box::new(assign_st), Box::new(ret_st))
         }
         Statement::Assign(p, rv) => Statement::Assign(p, rv),
+        Statement::AssignGlobal(id, g) => Statement::AssignGlobal(id, g),
         Statement::FakeRead(p) => Statement::FakeRead(p),
         Statement::SetDiscriminant(p, vid) => Statement::SetDiscriminant(p, vid),
         Statement::Drop(p) => Statement::Drop(p),
@@ -51,25 +57,26 @@ fn transform_st(st: Statement) -> Statement {
         }
     }
 }
-fn transform_def(mut def: FunDecl) -> FunDecl {
-    trace!("About to update: {}", def.name);
-    // If the return type is unit: apply the transformation
-    if def.signature.output.is_unit() {
-        def.body = match def.body {
-            Option::Some(mut body) => {
-                body.body = transform_st(body.body);
-                Option::Some(body)
-            }
-            Option::None => Option::None,
-        };
-        def
-    }
-    // Otherwise, do nothing
-    else {
-        def
+
+fn transform_body(name: &Name, body: &mut Option<ExprBody>) {
+    if let Some(b) = body.as_mut() {
+        trace!("About to insert assign and return unit: {name}");
+        take(&mut b.body, transform_st);
     }
 }
 
-pub fn transform(defs: FunDecls) -> FunDecls {
-    FunDecls::from_iter(defs.into_iter().map(|def| transform_def(def)))
+fn transform_function(def: &mut FunDecl) {
+    if def.signature.output.is_unit() {
+        transform_body(&def.name, &mut def.body);
+    }
+}
+fn transform_global(def: &mut GlobalDecl) {
+    if def.ty.is_unit() {
+        transform_body(&def.name, &mut def.body);
+    }
+}
+
+pub fn transform(funs: &mut FunDecls, globals: &mut GlobalDecls) {
+    funs.iter_mut().for_each(transform_function);
+    globals.iter_mut().for_each(transform_global);
 }

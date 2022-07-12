@@ -11,6 +11,25 @@ use std::iter::FromIterator;
 /// Our redefinition of Result - we don't care much about the I/O part.
 pub type Result<T> = std::result::Result<T, ()>;
 
+/// Propagate the error from a callback to the caller :
+/// Used to avoid saving, checking and returning the result by hand.
+/// The callback will not be called again if it returned an error.
+/// The dynamic signature is used to pass a generic function as argument.
+/// A simple use case is shown in [test_propagate_error].
+pub fn propagate_error<T, C, F>(consumer: C, mut callback: F) -> Result<()>
+where
+    F: FnMut(T) -> Result<()>,
+    C: FnOnce(&mut dyn FnMut(T) -> ()),
+{
+    let mut res = Ok(());
+    consumer(&mut |arg: T| {
+        if res.is_ok() {
+            res = callback(arg);
+        }
+    });
+    res
+}
+
 /// We use both `ErrorEmitter` and the logger to report errors and warnings.
 /// Those two ways of reporting information don't target the same usage and
 /// the same users.
@@ -26,11 +45,11 @@ pub trait ErrorEmitter {
 
 impl ErrorEmitter for Session {
     fn span_err<S: Into<MultiSpan>>(&self, s: S, msg: &str) {
-        self.span_err_with_code(s, msg, DiagnosticId::Error(String::from("Aenea")));
+        self.span_err_with_code(s, msg, DiagnosticId::Error(String::from("Aeneas")));
     }
 
     fn span_warn<S: Into<MultiSpan>>(&self, s: S, msg: &str) {
-        self.span_warn_with_code(s, msg, DiagnosticId::Error(String::from("Aenea")));
+        self.span_warn_with_code(s, msg, DiagnosticId::Error(String::from("Aeneas")));
     }
 }
 
@@ -316,4 +335,22 @@ impl<'a, K: Serialize, V: Serialize> Serialize for LinkedHashMapSerializer<'a, K
     {
         serialize_collection(self.map.iter(), serializer)
     }
+}
+
+#[test]
+fn test_propagate_error() {
+    let ints = &[1, 2, 3, 4, 5, 6];
+    let mut sum = 0;
+    let res = propagate_error(
+        |f| ints.iter().for_each(f),
+        |x| {
+            if *x == 4 {
+                return Err(());
+            }
+            sum += *x;
+            Ok(())
+        },
+    );
+    assert!(res.is_err());
+    assert!(sum == 6);
 }

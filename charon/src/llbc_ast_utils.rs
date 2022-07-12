@@ -1,14 +1,126 @@
 //! Implementations for llbc_ast.rs
 
 #![allow(dead_code)]
-use crate::common::*;
+use std::ops::DerefMut;
+
+use crate::expressions::{Operand, Place, Rvalue};
 use crate::formatter::Formatter;
-use crate::im_ast::{fmt_call, FunDeclId, FunSigFormatter, GAstFormatter, TAB_INCR};
-use crate::llbc_ast::{Call, FunDecl, FunDecls, Statement, SwitchTargets};
+use crate::im_ast::{fmt_call, FunDeclId, FunSigFormatter, GAstFormatter, GlobalDeclId, TAB_INCR};
+use crate::llbc_ast::{Call, FunDecl, FunDecls, GlobalDecl, GlobalDecls, Statement, SwitchTargets};
 use crate::types::*;
 use crate::values::*;
+use crate::{common::*, id_vector};
+use itertools::chain;
 use serde::ser::SerializeTupleVariant;
 use serde::{Serialize, Serializer};
+use take_mut::take;
+
+/// Goes from e.g. [A, B, C] ; D to (A, (B, (C, D))).
+pub fn chain_statements(firsts: Vec<Statement>, last: Statement) -> Statement {
+    firsts.into_iter().rev().fold(last, |cont, bind| {
+        assert!(!bind.is_sequence());
+        Statement::Sequence(Box::new(bind), Box::new(cont))
+    })
+}
+
+/// Utility function for [new_sequence].
+/// Efficiently appends a new statement at the rightmost place of a well-formed sequence.
+fn append_rightmost(seq: &mut Statement, r: Box<Statement>) {
+    let (_l1, l2) = match seq {
+        Statement::Sequence(l1, l2) => (l1, l2),
+        _ => unreachable!(),
+    };
+    if l2.is_sequence() {
+        append_rightmost(l2, r);
+    } else {
+        take(l2.deref_mut(), move |l2| {
+            Statement::Sequence(Box::new(l2), r)
+        });
+    }
+}
+
+/// Builds a sequence from well-formed statements.
+/// Ensures that the left statement will not be a sequence in the new sequence:
+/// Must be used instead of the raw [Statement::Sequence] constructor,
+/// unless you're sure that the left statement is not a sequence.
+pub fn new_sequence(mut l: Statement, r: Statement) -> Statement {
+    let r = Box::new(r);
+    match l {
+        Statement::Sequence(_, _) => {
+            append_rightmost(&mut l, r);
+            l
+        }
+        l => Statement::Sequence(Box::new(l), r),
+    }
+}
+
+/// Visit an rvalue and generate statements. Used below in [transform_operands].
+fn transform_rvalue_operands<F: FnMut(&mut Operand) -> Vec<Statement>>(
+    rval: &mut Rvalue,
+    f: &mut F,
+) -> Vec<Statement> {
+    match rval {
+        Rvalue::Use(op) | Rvalue::UnaryOp(_, op) => f(op),
+        Rvalue::BinaryOp(_, o1, o2) => chain(f(o1), f(o2)).collect(),
+        Rvalue::Aggregate(_, ops) => ops.iter_mut().flat_map(f).collect(),
+        Rvalue::Discriminant(_) | Rvalue::Ref(_, _) => vec![],
+    }
+}
+
+/// Transform a statement by visiting its operands and inserting the generated
+/// statements before each visited operand.
+/// Useful to implement a pass on operands: see e.g. [extract_global_assignments.rs].
+pub fn transform_operands<F: FnMut(&mut Operand) -> Vec<Statement>>(
+    st: Statement,
+    f: &mut F,
+) -> Statement {
+    // Does two matchs, depending if we want to move or to borrow the statement.
+    let mut st = match st {
+        // Recursive calls
+        Statement::Loop(s) => Statement::Loop(Box::new(transform_operands(*s, f))),
+        Statement::Sequence(s1, s2) => {
+            new_sequence(transform_operands(*s1, f), transform_operands(*s2, f))
+        }
+        Statement::Switch(op, tgt) => Statement::Switch(
+            op,
+            match tgt {
+                SwitchTargets::If(s1, s2) => SwitchTargets::If(
+                    Box::new(transform_operands(*s1, f)),
+                    Box::new(transform_operands(*s2, f)),
+                ),
+                SwitchTargets::SwitchInt(ty, vec, s) => SwitchTargets::SwitchInt(
+                    ty,
+                    vec.into_iter()
+                        .map(|(v, s)| (v, transform_operands(s, f)))
+                        .collect(),
+                    Box::new(transform_operands(*s, f)),
+                ),
+            },
+        ),
+        _ => st,
+    };
+    let new_st = match &mut st {
+        // Actual transformations
+        Statement::Switch(op, _) => f(op),
+        Statement::Assign(_, r) => transform_rvalue_operands(r, f),
+        Statement::Call(c) => c.args.iter_mut().flat_map(f).collect(),
+        Statement::Assert(a) => f(&mut a.cond),
+
+        // Identity (complete match for compile-time errors when new statements are created)
+        Statement::AssignGlobal(_, _)
+        | Statement::FakeRead(_)
+        | Statement::SetDiscriminant(_, _)
+        | Statement::Drop(_)
+        | Statement::Panic
+        | Statement::Return
+        | Statement::Break(_)
+        | Statement::Continue(_)
+        | Statement::Nop
+        | Statement::Sequence(_, _)
+        | Statement::Loop(_) => vec![],
+    };
+    chain_statements(new_st, st)
+}
 
 impl SwitchTargets {
     pub fn get_targets(&self) -> Vec<&Statement> {
@@ -69,6 +181,7 @@ impl Statement {
             + Formatter<TypeDeclId::Id>
             + Formatter<&'a ErasedRegion>
             + Formatter<FunDeclId::Id>
+            + Formatter<GlobalDeclId::Id>
             + Formatter<(TypeDeclId::Id, VariantId::Id)>
             + Formatter<(TypeDeclId::Id, Option<VariantId::Id>, FieldId::Id)>,
     {
@@ -80,8 +193,15 @@ impl Statement {
                 rvalue.fmt_with_ctx(ctx),
             )
             .to_owned(),
+            Statement::AssignGlobal(id, gid) => format!(
+                "{}{} := {}",
+                tab,
+                ctx.format_object(*id),
+                ctx.format_object(*gid),
+            )
+            .to_owned(),
             Statement::FakeRead(place) => {
-                format!("{}@fake_read({})", tab, place.fmt_with_ctx(ctx),).to_owned()
+                format!("{}@fake_read({})", tab, place.fmt_with_ctx(ctx)).to_owned()
             }
             Statement::SetDiscriminant(place, variant_id) => format!(
                 "{}@discriminant({}) := {}",
@@ -90,9 +210,7 @@ impl Statement {
                 variant_id.to_string()
             )
             .to_owned(),
-            Statement::Drop(place) => {
-                format!("{}drop {}", tab, place.fmt_with_ctx(ctx),).to_owned()
-            }
+            Statement::Drop(place) => format!("{}drop {}", tab, place.fmt_with_ctx(ctx)).to_owned(),
             Statement::Assert(assert) => format!(
                 "{}assert({} == {})",
                 tab,
@@ -190,12 +308,19 @@ impl Statement {
     }
 }
 
-type AstFormatter<'ctx> = GAstFormatter<'ctx, FunDecls>;
+type AstFormatter<'ctx> = GAstFormatter<'ctx, FunDecls, GlobalDecls>;
 
 impl<'ctx> Formatter<FunDeclId::Id> for AstFormatter<'ctx> {
     fn format_object(&self, id: FunDeclId::Id) -> String {
         let f = self.fun_context.get(id).unwrap();
         f.name.to_string()
+    }
+}
+
+impl<'ctx> Formatter<GlobalDeclId::Id> for AstFormatter<'ctx> {
+    fn format_object(&self, id: GlobalDeclId::Id) -> String {
+        let c = self.global_context.get(id).unwrap();
+        c.name.to_string()
     }
 }
 
@@ -205,8 +330,31 @@ impl<'ctx> Formatter<&Statement> for AstFormatter<'ctx> {
     }
 }
 
+impl<'ctx> Formatter<&Rvalue> for AstFormatter<'ctx> {
+    fn format_object(&self, v: &Rvalue) -> String {
+        v.fmt_with_ctx(self)
+    }
+}
+
+impl<'ctx> Formatter<&Place> for AstFormatter<'ctx> {
+    fn format_object(&self, p: &Place) -> String {
+        p.fmt_with_ctx(self)
+    }
+}
+
+impl<'ctx> Formatter<&Operand> for AstFormatter<'ctx> {
+    fn format_object(&self, op: &Operand) -> String {
+        op.fmt_with_ctx(self)
+    }
+}
+
 impl FunDecl {
-    pub fn fmt_with_defs<'ctx>(&self, ty_ctx: &'ctx TypeDecls, fun_ctx: &'ctx FunDecls) -> String {
+    pub fn fmt_with_defs<'ctx>(
+        &self,
+        ty_ctx: &'ctx TypeDecls,
+        fun_ctx: &'ctx FunDecls,
+        const_ctx: &'ctx GlobalDecls,
+    ) -> String {
         // Initialize the contexts
         let fun_sig_ctx = FunSigFormatter {
             ty_ctx,
@@ -221,9 +369,38 @@ impl FunDecl {
             Some(body) => &body.locals,
         };
 
-        let eval_ctx = AstFormatter::new(ty_ctx, fun_ctx, &self.signature.type_params, locals);
+        let eval_ctx = AstFormatter::new(
+            ty_ctx,
+            fun_ctx,
+            const_ctx,
+            &self.signature.type_params,
+            locals,
+        );
 
         // Use the contexts for printing
         self.gfmt_with_ctx("", &fun_sig_ctx, &eval_ctx)
+    }
+}
+
+impl GlobalDecl {
+    pub fn fmt_with_defs<'ctx>(
+        &self,
+        ty_ctx: &'ctx TypeDecls,
+        fun_ctx: &'ctx FunDecls,
+        const_ctx: &'ctx GlobalDecls,
+    ) -> String {
+        // We cheat a bit: if there is a body, we take its locals, otherwise
+        // we use []:
+        let empty = VarId::Vector::new();
+        let locals = match &self.body {
+            None => &empty,
+            Some(body) => &body.locals,
+        };
+
+        let empty = id_vector::Vector::new();
+        let eval_ctx = AstFormatter::new(ty_ctx, fun_ctx, const_ctx, &empty, locals);
+
+        // Use the contexts for printing
+        self.gfmt_with_ctx("", &eval_ctx)
     }
 }

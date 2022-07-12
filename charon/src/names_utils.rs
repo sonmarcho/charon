@@ -153,18 +153,13 @@ pub fn item_def_id_to_name(tcx: TyCtxt, def_id: DefId) -> ItemName {
     // - we convert the path to a name starting *with the end*
     // - whenever we find an "impl" path element, we can actually lookup its
     //   type (yes, it makes sense for rustc...), which allows us to retrieve
-    //   the type identifier, and continue from there.
-    //   Of course, it might cause a bit of trouble if an implementation for
-    //   a type is defined in a different module from the one where the type
-    //   is defined: we need to do more testing. A different possibility would
-    //   be to just grab the last path element of the type identifier (say
-    //   the identifier is "list::List", we only use "List" and insert it
-    //   in the name).
+    //   the type identifier. We then grab its last path element of the type
+    //   identifier (say the identifier is "list::List", we only use "List"
+    //   and insert it in the name).
     //
-    // Besides, as there may be several "impl" blocks for one type,
-    // As there may be several "impl" blocks for one type, each impl block is
-    // identified by a unique number (rustc calls this a "disambiguator"),
-    // which we grab.
+    // Besides, as there may be several "impl" blocks for one type, each impl
+    // block is identified by a unique number (rustc calls this a
+    // "disambiguator"), which we grab.
     let mut found_crate_name = false;
     let mut id = def_id;
     let mut name: Vec<PathElem> = Vec::new();
@@ -219,20 +214,21 @@ pub fn item_def_id_to_name(tcx: TyCtxt, def_id: DefId) -> ItemName {
                 )));
 
                 // "impl" blocks are defined for types.
-                // We retrieve the type in which the impl block belongs,
-                // and continue from this type's id.
+                // We retrieve its unqualified type name.
                 let ty = tcx.type_of(id);
 
-                // Match over the type - it should be an ADT
-                match ty.kind() {
-                    rustc_middle::ty::TyKind::Adt(adt_def, _) => id = adt_def.did,
-                    _ => {
-                        unreachable!();
+                // Match over the type.
+                name.push(PathElem::Ident(match ty.kind() {
+                    rustc_middle::ty::TyKind::Adt(adt_def, _) => {
+                        let mut type_name = type_def_id_to_name(tcx, adt_def.did);
+                        type_name.name.pop().unwrap().to_string()
                     }
-                };
-
-                // Continue so as not to pop the type identifier
-                continue;
+                    // Builtin cases.
+                    rustc_middle::ty::TyKind::Int(_) | rustc_middle::ty::TyKind::Uint(_) => {
+                        format!("{:?}", ty)
+                    }
+                    _ => unreachable!(),
+                }));
             }
             DefPathData::ImplTrait => {
                 // TODO: this should work the same as for `Impl`
@@ -288,6 +284,10 @@ pub fn function_def_id_to_name(tcx: TyCtxt, def_id: DefId) -> FunName {
     item_def_id_to_name(tcx, def_id)
 }
 
+pub fn global_def_id_to_name(tcx: TyCtxt, def_id: DefId) -> GlobalName {
+    item_def_id_to_name(tcx, def_id)
+}
+
 pub fn trait_def_id_to_name(tcx: TyCtxt, def_id: DefId) -> FunName {
     item_def_id_to_name(tcx, def_id)
 }
@@ -322,6 +322,7 @@ pub fn hir_item_to_name(tcx: TyCtxt, item: &Item) -> Option<HirItemName> {
         | ItemKind::Impl(_)
         | ItemKind::Mod(_)
         | ItemKind::Const(_, _)
+        | ItemKind::Static(_, _, _)
         | ItemKind::Macro(_) => Option::Some(item_def_id_to_name(tcx, def_id)),
         _ => {
             unimplemented!("{:?}", item.kind);

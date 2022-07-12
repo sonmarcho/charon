@@ -1,3 +1,3 @@
 .PHONY: all
 all:
-	cargo build
+	cargo build && cargo test

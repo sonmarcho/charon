@@ -40,7 +40,7 @@ pub struct RegionVar {
     pub name: Option<String>,
 }
 
-/// Region as used in afunction's signatures (in which case we use region variable
+/// Region as used in a function's signatures (in which case we use region variable
 /// ids) and in symbolic variables and projections (in which case we use region
 /// ids).
 #[derive(

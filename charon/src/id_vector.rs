@@ -182,6 +182,12 @@ where
     }
 }
 
+impl<I: ToUsize, T: Clone> Default for Vector<I, T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<'a, I, T> IntoIterator for &'a Vector<I, T>
 where
     I: ToUsize,

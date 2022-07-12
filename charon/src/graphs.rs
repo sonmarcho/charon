@@ -155,21 +155,21 @@ pub fn reorder_sccs<Id: std::fmt::Debug + Copy + std::hash::Hash + Eq>(
     }
 
     // Generate the reordered SCCs
-    let out_sccs = reordered_sccs_ids
+    let tgt_sccs = reordered_sccs_ids
         .iter()
         .map(|scc_id| reordered_sccs[*scc_id].clone())
         .collect();
 
     // Compute the dependencies with the new indices
-    let mut out_deps: Vec<OrdSet<usize>> = reordered_sccs.iter().map(|_| OrdSet::new()).collect();
+    let mut tgt_deps: Vec<OrdSet<usize>> = reordered_sccs.iter().map(|_| OrdSet::new()).collect();
     for old_id in 0..scc_deps.len() {
         let new_id = old_id_to_new_id[old_id];
-        out_deps[new_id] =
+        tgt_deps[new_id] =
             OrdSet::from_iter(scc_deps[old_id].iter().map(|old| old_id_to_new_id[*old]));
     }
 
     SCCs {
-        sccs: out_sccs,
-        scc_deps: out_deps,
+        sccs: tgt_sccs,
+        scc_deps: tgt_deps,
     }
 }

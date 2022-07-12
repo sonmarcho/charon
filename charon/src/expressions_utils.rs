@@ -5,12 +5,22 @@ use crate::assumed;
 use crate::common::*;
 use crate::expressions::*;
 use crate::formatter::Formatter;
+use crate::im_ast::GlobalDeclId;
 use crate::types::*;
 use crate::values;
 use crate::values::*;
 use serde::ser::SerializeStruct;
 use serde::ser::SerializeTupleVariant;
 use serde::{Serialize, Serializer};
+
+impl Place {
+    pub fn new(var_id: VarId::Id) -> Place {
+        Place {
+            var_id,
+            projection: im::Vector::new(),
+        }
+    }
+}
 
 impl Serialize for Place {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -120,7 +130,7 @@ impl std::string::ToString for Place {
 impl OperandConstantValue {
     pub fn fmt_with_ctx<T>(&self, ctx: &T) -> String
     where
-        T: Formatter<TypeDeclId::Id>,
+        T: Formatter<TypeDeclId::Id> + Formatter<GlobalDeclId::Id>,
     {
         match self {
             OperandConstantValue::ConstantValue(c) => c.to_string(),
@@ -135,6 +145,8 @@ impl OperandConstantValue {
                 let values: Vec<String> = values.iter().map(|v| v.fmt_with_ctx(ctx)).collect();
                 format!("ConstAdt {} [{}]", variant_id, values.join(", ")).to_string()
             }
+            OperandConstantValue::ConstantId(id) => ctx.format_object(*id),
+            OperandConstantValue::StaticId(id) => format!("alloc: &{}", ctx.format_object(*id)),
         }
     }
 }
@@ -150,12 +162,13 @@ impl Operand {
     where
         T: Formatter<VarId::Id>
             + Formatter<TypeDeclId::Id>
+            + Formatter<GlobalDeclId::Id>
             + Formatter<(TypeDeclId::Id, Option<VariantId::Id>, FieldId::Id)>,
     {
         match self {
             Operand::Copy(p) => format!("copy ({})", p.fmt_with_ctx(ctx)).to_string(),
             Operand::Move(p) => format!("move ({})", p.fmt_with_ctx(ctx)).to_string(),
-            Operand::Constant(_, c) => format!("const ({})", c.fmt_with_ctx(ctx)).to_string(),
+            Operand::Const(_, c) => format!("const ({})", c.fmt_with_ctx(ctx)).to_string(),
         }
     }
 
@@ -176,6 +189,7 @@ impl Rvalue {
     where
         T: Formatter<VarId::Id>
             + Formatter<TypeDeclId::Id>
+            + Formatter<GlobalDeclId::Id>
             + Formatter<(TypeDeclId::Id, VariantId::Id)>
             + Formatter<(TypeDeclId::Id, Option<VariantId::Id>, FieldId::Id)>,
     {
@@ -298,37 +312,11 @@ impl Serialize for OperandConstantValue {
     where
         S: Serializer,
     {
-        let enum_name = "OperandConstantValue";
-        // We change the variant names for serialization
-        let variant_name = match self {
-            OperandConstantValue::ConstantValue(_) => "ConstantValue",
-            OperandConstantValue::Adt(_, _) => "ConstantAdt",
-        };
-        let (variant_index, variant_arity) = self.variant_index_arity();
-        // It seems the "standard" way of doing is the following (this is
-        // consistent with what the automatically generated serializer does):
-        // - if the arity is > 0, use `serialize_tuple_variant`
-        // - otherwise simply serialize a string with the variant name
-        if variant_arity > 0 {
-            let mut vs = serializer.serialize_tuple_variant(
-                enum_name,
-                variant_index,
-                variant_name,
-                variant_arity,
-            )?;
-            match self {
-                OperandConstantValue::ConstantValue(cv) => {
-                    vs.serialize_field(cv)?;
-                }
-                OperandConstantValue::Adt(variant_id, values) => {
-                    vs.serialize_field(variant_id)?;
-                    let values = VectorSerializer::new(values);
-                    vs.serialize_field(&values)?;
-                }
-            }
-            vs.end()
-        } else {
-            variant_name.serialize(serializer)
+        match self {
+            // OperandConstantValue exists only to handle temporary cases inherited from the MIR :
+            // for the final LLBC format, we simply export the underlying constant value.
+            OperandConstantValue::ConstantValue(cv) => cv.serialize(serializer),
+            _ => unreachable!("unexpected `{:?}`: other `OperandConstantValue` fields than `ConstantValue` are temporary and should not occur in serialized LLBC", self),
         }
     }
 }

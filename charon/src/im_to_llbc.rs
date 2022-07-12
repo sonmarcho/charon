@@ -18,8 +18,8 @@
 //! only be performed by terminators -, meaning that MIR graphs don't have that
 //! many nodes and edges).
 
-use crate::im_ast as src;
 use crate::im_ast::FunDeclId;
+use crate::im_ast::{self as src, GlobalDeclId};
 use crate::llbc_ast as tgt;
 use crate::types::TypeDecls;
 use crate::values as v;
@@ -34,12 +34,12 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::iter::FromIterator;
 
-pub type Defs = tgt::FunDecls;
+pub type Defs = (tgt::FunDecls, tgt::GlobalDecls);
 
 /// Control-Flow Graph
 type Cfg = DiGraphMap<src::BlockId::Id, ()>;
 
-fn get_block_targets(body: &src::FunBody, block_id: src::BlockId::Id) -> Vec<src::BlockId::Id> {
+fn get_block_targets(body: &src::ExprBody, block_id: src::BlockId::Id) -> Vec<src::BlockId::Id> {
     let block = body.body.get(block_id).unwrap();
 
     match &block.terminator {
@@ -99,7 +99,7 @@ struct CfgInfo {
 
 /// Build the CFGs (the "regular" CFG and the CFG without backward edges) and
 /// compute some information like the loop entries and the switch blocks.
-fn build_cfg_partial_info(body: &src::FunBody) -> CfgPartialInfo {
+fn build_cfg_partial_info(body: &src::ExprBody) -> CfgPartialInfo {
     let mut cfg = CfgPartialInfo {
         cfg: Cfg::new(),
         cfg_no_be: Cfg::new(),
@@ -128,7 +128,7 @@ fn build_cfg_partial_info(body: &src::FunBody) -> CfgPartialInfo {
     cfg
 }
 
-fn block_is_switch(body: &src::FunBody, block_id: src::BlockId::Id) -> bool {
+fn block_is_switch(body: &src::ExprBody, block_id: src::BlockId::Id) -> bool {
     let block = body.body.get(block_id).unwrap();
     block.terminator.is_switch()
 }
@@ -137,7 +137,7 @@ fn build_cfg_partial_info_edges(
     cfg: &mut CfgPartialInfo,
     ancestors: &im::HashSet<src::BlockId::Id>,
     explored: &mut im::HashSet<src::BlockId::Id>,
-    body: &src::FunBody,
+    body: &src::ExprBody,
     block_id: src::BlockId::Id,
 ) {
     // Check if we already explored the current node
@@ -1326,7 +1326,7 @@ enum GotoKind {
 fn translate_child_block(
     no_code_duplication: bool,
     cfg: &CfgInfo,
-    body: &src::FunBody,
+    body: &src::ExprBody,
     exits_info: &ExitInfo,
     parent_loops: Vector<src::BlockId::Id>,
     switch_exit_blocks: &im::HashSet<src::BlockId::Id>,
@@ -1378,7 +1378,7 @@ fn translate_statement(st: &src::Statement) -> Option<tgt::Statement> {
 fn translate_terminator(
     no_code_duplication: bool,
     cfg: &CfgInfo,
-    body: &src::FunBody,
+    body: &src::ExprBody,
     exits_info: &ExitInfo,
     parent_loops: Vector<src::BlockId::Id>,
     switch_exit_blocks: &im::HashSet<src::BlockId::Id>,
@@ -1592,6 +1592,7 @@ fn is_terminal(exp: &tgt::Statement) -> bool {
 fn is_terminal_explore(num_loops: usize, st: &tgt::Statement) -> bool {
     match st {
         tgt::Statement::Assign(_, _)
+        | tgt::Statement::AssignGlobal(_, _)
         | tgt::Statement::FakeRead(_)
         | tgt::Statement::SetDiscriminant(_, _)
         | tgt::Statement::Drop(_)
@@ -1621,7 +1622,7 @@ fn is_terminal_explore(num_loops: usize, st: &tgt::Statement) -> bool {
 fn translate_block(
     no_code_duplication: bool,
     cfg: &CfgInfo,
-    body: &src::FunBody,
+    body: &src::ExprBody,
     exits_info: &ExitInfo,
     parent_loops: Vector<src::BlockId::Id>,
     switch_exit_blocks: &im::HashSet<src::BlockId::Id>,
@@ -1774,84 +1775,98 @@ fn translate_block(
 }
 
 /// [type_defs]: this parameter is used for pretty-printing purposes
+fn translate_body(no_code_duplication: bool, src_body: &src::ExprBody) -> tgt::ExprBody {
+    // Explore the function body to create the control-flow graph without backward
+    // edges, and identify the loop entries (which are destinations of backward edges).
+    let cfg_info = build_cfg_partial_info(src_body);
+    let cfg_info = compute_cfg_info_from_partial(cfg_info);
+
+    // Find the exit block for all the loops and switches, if such an exit point
+    // exists.
+    let exits_info = compute_loop_switch_exits(&cfg_info);
+
+    // Debugging
+    trace!("exits map:\n{:?}", exits_info);
+
+    // Translate the body by reconstructing the loops and the
+    // conditional branchings.
+    // Note that we shouldn't get `None`.
+    let mut explored = HashSet::new();
+    let stmt = translate_block(
+        no_code_duplication,
+        &cfg_info,
+        src_body,
+        &exits_info,
+        Vector::new(),
+        &im::HashSet::new(),
+        &mut explored,
+        src::BlockId::ZERO,
+    )
+    .unwrap();
+
+    // Sanity: check that we translated all the blocks
+    for (bid, _) in src_body.body.iter_indexed_values() {
+        assert!(explored.contains(&bid));
+    }
+
+    tgt::ExprBody {
+        arg_count: src_body.arg_count,
+        locals: src_body.locals.clone(),
+        body: stmt,
+    }
+}
+
+/// [type_defs] [global_defs]: this parameter is used for pretty-printing purposes
 fn translate_function(
     no_code_duplication: bool,
     type_defs: &TypeDecls,
     src_defs: &src::FunDecls,
     src_def_id: FunDeclId::Id,
+    global_defs: &src::GlobalDecls,
 ) -> tgt::FunDecl {
     // Retrieve the function definition
     let src_def = src_defs.get(src_def_id).unwrap();
     trace!(
         "# Reconstructing: {}\n\n{}",
         src_def.name,
-        src_def.fmt_with_defs(&type_defs, &src_defs)
+        src_def.fmt_with_defs(&type_defs, &src_defs, &global_defs)
     );
-
-    // Translate the body if the function is transparent, ignore otherwise
-    // (if the function is opaque)
-    let body = match &src_def.body {
-        Option::Some(src_body) => {
-            // Explore the function body to create the control-flow graph without backward
-            // edges, and identify the loop entries (which are destinations of backward edges).
-            let cfg_info = build_cfg_partial_info(src_body);
-            let cfg_info = compute_cfg_info_from_partial(cfg_info);
-
-            // Find the exit block for all the loops and switches, if such an exit point
-            // exists.
-            let exits_info = compute_loop_switch_exits(&cfg_info);
-
-            // Debugging
-            trace!("exits map:\n{:?}", exits_info);
-
-            // Translate the body by reconstructing the loops and the
-            // conditional branchings.
-            // Note that we shouldn't get `None`.
-            let mut explored = HashSet::new();
-            let body_exp = translate_block(
-                no_code_duplication,
-                &cfg_info,
-                src_body,
-                &exits_info,
-                Vector::new(),
-                &im::HashSet::new(),
-                &mut explored,
-                src::BlockId::ZERO,
-            )
-            .unwrap();
-
-            // Sanity: check that we translated all the blocks
-            for (bid, _) in src_body.body.iter_indexed_values() {
-                assert!(explored.contains(&bid));
-            }
-
-            // Create the new body
-            let src::FunBody {
-                arg_count,
-                locals,
-                body: _,
-            } = src_body;
-
-            let body = tgt::FunBody {
-                arg_count: *arg_count,
-                locals: locals.clone(),
-                body: body_exp,
-            };
-
-            Option::Some(body)
-        }
-        Option::None => {
-            // Opaque definition
-            Option::None
-        }
-    };
 
     // Return the translated definition
     tgt::FunDecl {
         def_id: src_def.def_id,
         name: src_def.name.clone(),
         signature: src_def.signature.clone(),
-        body,
+        body: src_def
+            .body
+            .as_ref()
+            .map(|b| translate_body(no_code_duplication, b)),
+    }
+}
+
+fn translate_global(
+    no_code_duplication: bool,
+    type_defs: &TypeDecls,
+    global_defs: &src::GlobalDecls,
+    global_id: GlobalDeclId::Id,
+    fun_defs: &src::FunDecls,
+) -> tgt::GlobalDecl {
+    // Retrieve the global definition
+    let src_def = global_defs.get(global_id).unwrap();
+    trace!(
+        "# Reconstructing: {}\n\n{}",
+        src_def.name,
+        src_def.fmt_with_defs(&type_defs, &fun_defs, &global_defs)
+    );
+
+    tgt::GlobalDecl {
+        def_id: src_def.def_id,
+        name: src_def.name.clone(),
+        ty: src_def.ty.clone(),
+        body: src_def
+            .body
+            .as_ref()
+            .map(|b| translate_body(no_code_duplication, b)),
     }
 }
 
@@ -1864,28 +1879,48 @@ fn translate_function(
 pub fn translate_functions(
     no_code_duplication: bool,
     type_defs: &TypeDecls,
-    src_defs: &src::FunDecls,
+    src_funs: &src::FunDecls,
+    src_globals: &src::GlobalDecls,
 ) -> Defs {
-    let mut out_defs = FunDeclId::Vector::new();
+    let mut tgt_funs = FunDeclId::Vector::new();
+    let mut tgt_globals = GlobalDeclId::Vector::new();
 
-    // Tranlsate the bodies one at a time
-    for src_def_id in src_defs.iter_indices() {
-        out_defs.push_back(translate_function(
+    // Translate the bodies one at a time
+    for fun_id in src_funs.iter_indices() {
+        tgt_funs.push_back(translate_function(
             no_code_duplication,
             type_defs,
-            src_defs,
-            src_def_id,
+            src_funs,
+            fun_id,
+            src_globals,
+        ));
+    }
+    for global_id in src_globals.iter_indices() {
+        tgt_globals.push_back(translate_global(
+            no_code_duplication,
+            type_defs,
+            src_globals,
+            global_id,
+            src_funs,
         ));
     }
 
     // Print the functions
-    for def in &out_defs {
+    for fun in &tgt_funs {
         trace!(
             "# Signature:\n{}\n\n# Function definition:\n{}\n",
-            def.signature.fmt_with_defs(&type_defs),
-            def.fmt_with_defs(&type_defs, &out_defs)
+            fun.signature.fmt_with_defs(&type_defs),
+            fun.fmt_with_defs(&type_defs, &tgt_funs, &tgt_globals)
+        );
+    }
+    // Print the global variables
+    for global in &tgt_globals {
+        trace!(
+            "# Type:\n{:?}\n\n# Global definition:\n{}\n",
+            global.ty,
+            global.fmt_with_defs(&type_defs, &tgt_funs, &tgt_globals)
         );
     }
 
-    out_defs
+    (tgt_funs, tgt_globals)
 }

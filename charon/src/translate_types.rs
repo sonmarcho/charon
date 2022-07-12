@@ -6,25 +6,34 @@ use crate::id_vector::ToUsize;
 use crate::names::type_def_id_to_name;
 use crate::regions_hierarchy;
 use crate::regions_hierarchy::TypesConstraintsMap;
+use crate::reorder_decls::DeclarationGroup;
 use crate::rust_to_local_ids::*;
 use crate::types as ty;
+use crate::types::TypeDeclId;
 use im;
 use im::Vector;
 use rustc_hir::def_id::DefId;
 use rustc_middle::mir::Mutability;
 use rustc_middle::ty::TyCtxt;
 use rustc_middle::ty::{Ty, TyKind};
-use std::collections::HashMap;
 
 /// Translation context for type definitions
 #[derive(Clone)]
 pub struct TypeTransContext<'ctx> {
     /// The type definitions - TODO: rename to type_defs
     pub types: &'ctx ty::TypeDecls,
-    /// Rust identifiers to translation identifiers
-    pub type_rid_to_id: &'ctx HashMap<DefId, ty::TypeDeclId::Id>,
-    /// Translation type identifiers to rust identifiers
-    pub type_id_to_rid: &'ctx HashMap<ty::TypeDeclId::Id, DefId>,
+    /// Ordered declarations allowing to convert id to and from rid.
+    decls: &'ctx OrderedDecls,
+}
+
+impl<'ctx> TypeTransContext<'ctx> {
+    pub fn new(types: &'ctx ty::TypeDecls, decls: &'ctx OrderedDecls) -> Self {
+        Self { types, decls }
+    }
+
+    pub fn get_id(&self, rid: DefId) -> TypeDeclId::Id {
+        *self.decls.type_rid_to_id.get(&rid).unwrap()
+    }
 }
 
 /// Auxiliary definition used to format definitions.
@@ -441,8 +450,7 @@ fn translate_defid(tcx: TyCtxt, trans_ctx: &TypeTransContext, def_id: DefId) -> 
     trace!("{:?}", def_id);
 
     if def_id.is_local() {
-        let id = trans_ctx.type_rid_to_id.get(&def_id).unwrap();
-        ty::TypeId::Adt(*id)
+        ty::TypeId::Adt(trans_ctx.get_id(def_id))
     } else {
         // Non-local: check if the type has primitive support
 
@@ -456,8 +464,7 @@ fn translate_defid(tcx: TyCtxt, trans_ctx: &TypeTransContext, def_id: DefId) -> 
             }
             Option::None => {
                 // The type is external
-                let id = trans_ctx.type_rid_to_id.get(&def_id).unwrap();
-                ty::TypeId::Adt(*id)
+                ty::TypeId::Adt(trans_ctx.get_id(def_id))
             }
         }
     }
@@ -554,11 +561,7 @@ fn translate_transparent_type<'tcx>(
     trace!("{}", trans_id);
 
     // Initialize the type translation context
-    let trans_ctx = TypeTransContext {
-        types: &type_defs,
-        type_rid_to_id: &decls.type_rid_to_id,
-        type_id_to_rid: &decls.type_id_to_rid,
-    };
+    let trans_ctx = TypeTransContext::new(&type_defs, &decls);
 
     // Retrieve the definition
     trace!("{:?}", def_id);
@@ -662,19 +665,20 @@ fn translate_type<'ctx>(
     type_defs: &mut ty::TypeDecls,
     trans_id: ty::TypeDeclId::Id,
 ) -> Result<()> {
-    // Check and translate the generics
-    let def_id = *decls.type_id_to_rid.get(&trans_id).unwrap();
-    let generics = translate_type_generics(tcx, def_id);
+    let info = decls.decls_info.get(&AnyDeclId::Type(trans_id)).unwrap();
 
-    // Check if the type is opaque or transparent, and delegate the translation
+    // Check and translate the generics
+    let generics = translate_type_generics(tcx, info.rid);
+
+    // Check if the type is opaque or external, and delegate the translation
     // of the "body" to the proper function
-    let kind = if decls.opaque_types.contains(&trans_id) {
+    let kind = if !info.is_local() || !info.is_transparent {
         // Opaque types are:
         // - external types
         // - local types flagged as opaque
         ty::TypeDeclKind::Opaque
     } else {
-        translate_transparent_type(tcx, decls, type_defs, trans_id, def_id, &generics)?
+        translate_transparent_type(tcx, decls, type_defs, trans_id, info.rid, &generics)?
     };
 
     // Register the type
@@ -686,7 +690,7 @@ fn translate_type<'ctx>(
         type_params_map: _,
     } = generics;
 
-    let name = type_def_id_to_name(tcx, def_id);
+    let name = type_def_id_to_name(tcx, info.rid);
     let region_params = ty::RegionVarId::Vector::from(region_params);
     let type_params = ty::TypeVarId::Vector::from(type_params);
 
@@ -749,8 +753,8 @@ pub fn translate_types(
                     );
                 }
             },
-            DeclarationGroup::Fun(_) => {
-                // Ignore the functions
+            DeclarationGroup::Fun(_) | DeclarationGroup::Global(_) => {
+                // Ignore the functions and constants
             }
         }
     }
@@ -762,11 +766,7 @@ pub fn translate_types(
     );
 
     // Print the translated types
-    let trans_ctx = TypeTransContext {
-        types: &type_defs,
-        type_rid_to_id: &decls.type_rid_to_id,
-        type_id_to_rid: &decls.type_id_to_rid,
-    };
+    let trans_ctx = TypeTransContext::new(&type_defs, &decls);
     for d in type_defs.types.iter() {
         trace!("translated type:\n{}\n", trans_ctx.format_object(d));
     }

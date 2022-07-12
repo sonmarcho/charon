@@ -7,6 +7,7 @@ use std::iter::FromIterator;
 fn statement_diverges(divergent: &HashMap<ast::FunDeclId::Id, bool>, st: &llbc::Statement) -> bool {
     match st {
         llbc::Statement::Assign(_, _)
+        | llbc::Statement::AssignGlobal(_, _)
         | llbc::Statement::FakeRead(_)
         | llbc::Statement::SetDiscriminant(_, _)
         | llbc::Statement::Drop(_)
@@ -84,8 +85,8 @@ pub fn compute_divergent_functions(
                     divergent_map.insert(*id, true);
                 }
             }
-            DeclarationGroup::Type(_) => {
-                // Ignore the type declarations
+            DeclarationGroup::Type(_) | DeclarationGroup::Global(_) => {
+                // Ignore the type and global declarations
                 continue;
             }
         }

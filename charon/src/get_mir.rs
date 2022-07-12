@@ -7,15 +7,26 @@ use rustc_middle::mir::Body;
 use rustc_middle::ty::{TyCtxt, WithOptConstParam};
 use std::cell::Ref;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum MirLevel {
-    /// Original MIR, directly translated from HIR
+    /// Original MIR, directly translated from HIR.
     Built,
-    /// Not sure what this is
+    /// Not sure what this is. Not well tested.
     Promoted,
     /// MIR after optimization passes. The last one before codegen.
     Optimized,
 }
+
+/// The level at which is queried the MIR.
+pub const MIR_LEVEL: MirLevel = MirLevel::Built;
+
+/// Indicates if the constants should be extracted in their own identifier,
+/// or if they must be evaluated to a constant value.
+pub const EXTRACT_CONSTANTS_AT_TOP_LEVEL: bool = match MIR_LEVEL {
+    MirLevel::Built => true,
+    MirLevel::Promoted => false,
+    MirLevel::Optimized => false,
+};
 
 fn get_mir_for_def_id_and_level<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -44,5 +55,5 @@ fn get_mir_for_def_id_and_level<'tcx>(
 }
 
 pub fn get_mir_for_def_id<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &'tcx Body<'tcx> {
-    get_mir_for_def_id_and_level(tcx, def_id, MirLevel::Built)
+    get_mir_for_def_id_and_level(tcx, def_id, MIR_LEVEL)
 }

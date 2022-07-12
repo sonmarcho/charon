@@ -4,6 +4,7 @@
 
 use crate::common::*;
 use crate::formatter::Formatter;
+use crate::im_ast::GlobalDeclId;
 use crate::types::*;
 use crate::values::*;
 use serde::ser::SerializeTupleVariant;
@@ -24,6 +25,12 @@ impl Formatter<VarId::Id> for DummyFormatter {
 impl Formatter<TypeDeclId::Id> for DummyFormatter {
     fn format_object(&self, id: TypeDeclId::Id) -> String {
         type_def_id_to_pretty_string(id)
+    }
+}
+
+impl Formatter<GlobalDeclId::Id> for DummyFormatter {
+    fn format_object(&self, id: GlobalDeclId::Id) -> String {
+        const_def_id_to_pretty_string(id)
     }
 }
 

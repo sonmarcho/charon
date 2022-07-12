@@ -37,6 +37,9 @@ pub struct Call {
 #[derive(Debug, Clone, EnumIsA, EnumAsGetters, Serialize)]
 pub enum Statement {
     Assign(Place, Rvalue),
+    /// Not present in MIR: we introduce it when replacing constant variables
+    /// in operands in [extract_global_assignments.rs]
+    AssignGlobal(VarId::Id, GlobalDeclId::Id),
     FakeRead(Place),
     SetDiscriminant(Place, VariantId::Id),
     Drop(Place),
@@ -59,6 +62,10 @@ pub enum Statement {
     Continue(usize),
     /// No-op.
     Nop,
+    /// The left statement must NOT be a sequence:
+    /// For example, let (x, y) be a sequence and a, b, c statements:
+    /// Then ((a, b), c) is forbidden and should be changed to (a, (b, c)).
+    /// To ensure that, use [llbc_ast_utils::new_sequence] to build sequences.
     Sequence(Box<Statement>, Box<Statement>),
     Switch(Operand, SwitchTargets),
     Loop(Box<Statement>),
@@ -89,10 +96,10 @@ pub enum SwitchTargets {
     ),
 }
 
+pub type ExprBody = GExprBody<Statement>;
+
+pub type FunDecl = GFunDecl<Statement>;
 pub type FunDecls = FunDeclId::Vector<FunDecl>;
 
-/// A function body
-pub type FunBody = GFunBody<Statement>;
-
-/// A function definition
-pub type FunDecl = GFunDecl<Statement>;
+pub type GlobalDecl = GGlobalDecl<Statement>;
+pub type GlobalDecls = GlobalDeclId::Vector<GlobalDecl>;

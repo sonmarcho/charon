@@ -1,5 +1,6 @@
 #![feature(rustc_private, register_tool)]
 #![feature(box_syntax, box_patterns)]
+#![feature(is_some_with)]
 #![feature(cell_leak)] // For Ref::leak
 // For rustdoc: prevents overflows
 #![recursion_limit = "256"]
@@ -25,6 +26,7 @@ extern crate rustc_resolve;
 extern crate rustc_session;
 extern crate rustc_span;
 extern crate rustc_target;
+extern crate take_mut;
 
 #[macro_use]
 mod common;
@@ -32,6 +34,7 @@ mod assumed;
 mod divergent;
 mod expressions;
 mod expressions_utils;
+mod extract_global_assignments;
 mod formatter;
 mod generics;
 mod get_mir;
@@ -49,6 +52,7 @@ mod names_utils;
 mod reconstruct_asserts;
 mod regions_hierarchy;
 mod register;
+mod regularize_constant_adts;
 mod remove_unused_locals;
 mod reorder_decls;
 mod rust_to_local_ids;
@@ -807,7 +811,7 @@ fn translate(sess: &Session, tcx: TyCtxt, internal: &ToInternal) -> Result<(), (
     // so we just ignore them).
     let crate_info = register::CrateInfo {
         crate_name: crate_name.clone(),
-        opaque: HashSet::from_iter(internal.opaque_modules.clone().into_iter()),
+        opaque_mods: HashSet::from_iter(internal.opaque_modules.clone().into_iter()),
     };
     let registered_decls = register::register_crate(&crate_info, sess, tcx)?;
 
@@ -828,7 +832,7 @@ fn translate(sess: &Session, tcx: TyCtxt, internal: &ToInternal) -> Result<(), (
     // # Step 5: translate the functions to IM (our Internal representation of MIR).
     // Note that from now onwards, both type and function definitions have been
     // translated to our internal ASTs: we don't interact with rustc anymore.
-    let im_defs = translate_functions_to_im::translate_functions(
+    let (im_fun_defs, im_global_defs) = translate_functions_to_im::translate_functions(
         tcx,
         &ordered_decls,
         &types_constraints,
@@ -837,8 +841,12 @@ fn translate(sess: &Session, tcx: TyCtxt, internal: &ToInternal) -> Result<(), (
 
     // # Step 6: go from IM to LLBC (Low-Level Borrow Calculus) by reconstructing
     // the control flow.
-    let llbc_defs =
-        im_to_llbc::translate_functions(internal.no_code_duplication, &type_defs, &im_defs);
+    let (mut llbc_funs, mut llbc_globals) = im_to_llbc::translate_functions(
+        internal.no_code_duplication,
+        &type_defs,
+        &im_fun_defs,
+        &im_global_defs,
+    );
 
     //
     // =================
@@ -851,51 +859,64 @@ fn translate(sess: &Session, tcx: TyCtxt, internal: &ToInternal) -> Result<(), (
 
     // # Step 7: simplify the calls to unops and binops
     // Note that we assume that the sequences have been flattened.
-    let llbc_defs = simplify_ops::simplify(llbc_defs);
+    simplify_ops::simplify(&mut llbc_funs, &mut llbc_globals);
 
-    for def in &llbc_defs {
+    // # Step 8: replace constant (OperandConstantValue) ADTs by regular (Aggregated) ADTs.
+    regularize_constant_adts::transform(&mut llbc_funs, &mut llbc_globals);
+
+    // # Step 9: extract statics and constant globals from operands (put them in
+    // a let binding). This pass relies on the absence of constant ADTs from
+    // the previous step: it does not inspect them (so it would miss globals in
+    // constant ADTs).
+    extract_global_assignments::transform(&mut llbc_funs, &mut llbc_globals);
+
+    for def in &llbc_funs {
         trace!(
             "# After binop simplification:\n{}\n",
-            def.fmt_with_defs(&type_defs, &llbc_defs)
+            def.fmt_with_defs(&type_defs, &llbc_funs, &llbc_globals)
         );
     }
 
-    // # Step 8: reconstruct the asserts
-    let llbc_defs = reconstruct_asserts::simplify(llbc_defs);
+    // # Step 10: reconstruct the asserts
+    reconstruct_asserts::simplify(&mut llbc_funs, &mut llbc_globals);
 
-    for def in &llbc_defs {
+    for def in &llbc_funs {
         trace!(
             "# After asserts reconstruction:\n{}\n",
-            def.fmt_with_defs(&type_defs, &llbc_defs)
+            def.fmt_with_defs(&type_defs, &llbc_funs, &llbc_globals)
         );
     }
 
-    // # Step 9: add the missing assignments to the return value.
+    // # Step 11: add the missing assignments to the return value.
     // When the function return type is unit, the generated MIR doesn't
     // set the return value to `()`. This can be a concern: in the case
     // of Aeneas, it means the return variable contains ⊥ upon returning.
     // For this reason, when the function has return type unit, we insert
     // an extra assignment just before returning.
-    let llbc_defs = insert_assign_return_unit::transform(llbc_defs);
+    // This also applies to globals (for checking or executing code before
+    // the main or at compile-time).
+    insert_assign_return_unit::transform(&mut llbc_funs, &mut llbc_globals);
 
-    // # Step 10: remove the locals which are never used. After doing so, we
+    // # Step 12: remove the locals which are never used. After doing so, we
     // check that there are no remaining locals with type `Never`.
-    let llbc_defs = remove_unused_locals::transform(llbc_defs);
+    remove_unused_locals::transform(&mut llbc_funs, &mut llbc_globals);
 
-    // # Step 11: compute which functions are potentially divergent. A function
+    // # Step 13: compute which functions are potentially divergent. A function
     // is potentially divergent if it is recursive, contains a loop or transitively
     // calls a potentially divergent function.
     // Note that in the future, we may complement this basic analysis with a
     // finer analysis to detect recursive functions which are actually total
     // by construction.
-    let _divergent = divergent::compute_divergent_functions(&ordered_decls, &llbc_defs);
+    // Because we don't have loops, constants are not yet touched.
+    let _divergent = divergent::compute_divergent_functions(&ordered_decls, &llbc_funs);
 
-    // # Step 11: generate the files.
+    // # Step 14: generate the files.
     llbc_export::export(
         crate_name,
         &ordered_decls,
         &type_defs,
-        &llbc_defs,
+        &llbc_funs,
+        &llbc_globals,
         &internal.dest_dir,
         &internal.source_file,
     )?;

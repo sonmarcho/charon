@@ -25,6 +25,7 @@ serial_test = "0.5.1"
 chrono = "0.4"
 structopt = "0.3.13"
 macros = { path = "../macros" }
+take_mut = "0.2.2"
 
 [dev-dependencies]
 assert_cmd = "1.0.1"

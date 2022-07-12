@@ -1,6 +1,7 @@
 //! Implements expressions: paths, operands, rvalues, lvalues
 
 pub use crate::expressions_utils::*;
+use crate::im_ast::GlobalDeclId;
 use crate::types::*;
 use crate::values::*;
 use im::Vector;
@@ -110,37 +111,50 @@ pub enum BinOp {
     // No Offset binary operation: this is an operation on raw pointers
 }
 
+/// The constructors match printed MIR operand prefixes (e.g. `const 2`).
 #[derive(Debug, PartialEq, Eq, Clone, EnumIsA, EnumAsGetters, VariantName, Serialize)]
 pub enum Operand {
     Copy(Place),
     Move(Place),
-    /// Constant value.
-    Constant(ETy, OperandConstantValue),
+    /// Constant value (including constant and static variables)
+    Const(ETy, OperandConstantValue),
 }
 
 /// Constant value for an operand.
+/// Only the `ConstantValue` case is remaining in LLBC final form.
 ///
+/// The other cases come from a straight translation from the MIR:
+///
+/// `Adt` case:
 /// It is a bit annoying, but rustc treats some ADT and tuple instances as
 /// constants when generating MIR:
 /// - an enumeration with one variant and no fields is a constant.
 /// - a structure with no field is a constant.
 /// - sometimes, Rust stores the initialization of an ADT as a constant
 ///   (if all the fields are constant) rather than as an aggregated value
+/// It is translated to regular ADTs, see [regularize_constant_adts.rs].
 ///
-/// For our translation, we use the following enumeration to encode those
-/// special cases in assignments. They are converted to "normal" values
-/// when evaluating the assignment (which is why we don't put them in the
-/// [`ConstantValue`](crate::ConstantValue) enumeration.
-/// TODO: implement a micro-pass to get rid of those.
+/// `Identifier` and `Static` case:
+/// Match constant variables. Their access will be done elsewhere in a
+/// separate statement, see [extract_global_assignments.rs].
 #[derive(Debug, PartialEq, Eq, Clone, VariantName, EnumIsA, EnumAsGetters, VariantIndexArity)]
 pub enum OperandConstantValue {
     ConstantValue(ConstantValue),
+    ///
     /// In most situations:
     /// Enumeration with one variant with no fields, structure with
     /// no fields, unit (encoded as a 0-tuple).
     ///
     /// Less frequently: arbitrary ADT values.
     Adt(Option<VariantId::Id>, Vector<OperandConstantValue>),
+    ///
+    /// The case when the constant is elsewhere.
+    /// The MIR seems to forbid more complex expressions like paths :
+    /// Reading the constant a.b is translated to { _1 = const a; _2 = (_1.0) }.
+    ConstantId(GlobalDeclId::Id),
+    ///
+    /// Same as for constants, except that statics are accessed through references.
+    StaticId(GlobalDeclId::Id),
 }
 
 #[derive(Debug, Clone, Serialize)]
